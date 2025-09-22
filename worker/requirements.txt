@@ -1,4 +1,5 @@
 praw
 vaderSentiment
-supabase-py
+supabase
 psycopg2-binary
+python-dotenv
