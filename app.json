@@ -12,9 +12,7 @@
       "resizeMode": "contain",
       "backgroundColor": "#ffffff"
     },
-    "ios": {
-      "supportsTablet": true
-    },
+    "ios": { "supportsTablet": true },
     "android": {
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
@@ -22,8 +20,12 @@
       },
       "edgeToEdgeEnabled": true
     },
-    "web": {
-      "favicon": "./assets/favicon.png"
+    "web": { "favicon": "./assets/favicon.png" },
+    "platforms": ["ios", "android", "web"],
+    "extra": {
+      "EXPO_PUBLIC_SUPABASE_URL": "https://pcfdtbjavgeidirymniz.supabase.co",
+      "EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY": "sb_publishable_TB5m5YpQm0gbe2XEiSZUhg_Iy7Z7rg5"
+     
     }
   }
 }
