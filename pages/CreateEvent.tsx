@@ -20,14 +20,14 @@ import { decode } from 'base64-arraybuffer';
 import { supabase } from '../lib/supabase';
 
 // ---------- Config ----------
-const STORAGE_BUCKET = 'Posters'; // 👈 your bucket name (case-sensitive)
+const STORAGE_BUCKET = 'Posters';
 
 // ---------- Helpers ----------
-const todayISO = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+const todayISO = new Date().toISOString().slice(0, 10);
 
 function isoFromDateAndHour(dateYMD: string, hour: number) {
   const [y, m, d] = dateYMD.split('-').map(Number);
-  const dt = new Date(y, (m - 1), d, hour, 0, 0, 0);
+  const dt = new Date(y, m - 1, d, hour, 0, 0, 0);
   return dt.toISOString();
 }
 function addHoursISO(iso: string, hours: number) {
@@ -37,11 +37,17 @@ function addHoursISO(iso: string, hours: number) {
 }
 function prettyDate(ymd: string) {
   const d = new Date(ymd + 'T00:00:00');
-  return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: '2-digit' });
+  return d.toLocaleDateString(undefined, {
+    year: 'numeric',
+    month: 'short',
+    day: '2-digit',
+  });
 }
-function two(n: number) { return n < 10 ? `0${n}` : `${n}`; }
+function two(n: number) {
+  return n < 10 ? `0${n}` : `${n}`;
+}
 
-const HOURS = Array.from({ length: 24 }, (_, h) => h); // 0..23
+const HOURS = Array.from({ length: 24 }, (_, h) => h);
 
 // ---------- Debug helper ----------
 async function testInsertNow() {
@@ -50,15 +56,17 @@ async function testInsertNow() {
 
   const { data, error, status } = await supabase
     .from('event_submissions')
-    .insert([{
-      title: 'Button Test',
-      description: 'quick test',
-      start_time: now.toISOString(),
-      end_time: end.toISOString(),
-      location: 'Test Hall',
-      tags: ['quick'],
-      status: 'pending',
-    }])
+    .insert([
+      {
+        title: 'Button Test',
+        description: 'quick test',
+        start_time: now.toISOString(),
+        end_time: end.toISOString(),
+        location: 'Test Hall',
+        tags: ['quick'],
+        // 👈 no status
+      },
+    ])
     .select('*')
     .single();
 
@@ -100,7 +108,9 @@ const CreateEvent: React.FC<CreateEventProps> = ({
 
   // Date + Time
   const [selectedDate, setSelectedDate] = useState<string>(todayISO);
-  const [selectedHour, setSelectedHour] = useState<number>(new Date().getHours());
+  const [selectedHour, setSelectedHour] = useState<number>(
+    new Date().getHours()
+  );
 
   // Poster
   const [posterUrl, setPosterUrl] = useState<string | null>(null);
@@ -109,20 +119,27 @@ const CreateEvent: React.FC<CreateEventProps> = ({
   // UI state
   const [saving, setSaving] = useState(false);
 
-  const canCreateEvent = !!title.trim() && !!description.trim() && !!location.trim();
+  const canCreateEvent =
+    !!title.trim() && !!description.trim() && !!location.trim();
 
   const markedDates: Record<string, any> = useMemo(
-    () => ({ [selectedDate]: { selected: true, selectedColor: '#3498db' } }),
+    () => ({
+      [selectedDate]: { selected: true, selectedColor: '#3498db' },
+    }),
     [selectedDate]
   );
 
-  // ---- Poster upload to Supabase Storage (bucket: Posters) ----
+  // ---- Poster upload ----
   const pickAndUploadPoster = async () => {
     try {
       if (Platform.OS !== 'web') {
-        const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
+        const { status } =
+          await ImagePicker.requestMediaLibraryPermissionsAsync();
         if (status !== 'granted') {
-          Alert.alert('Permission required', 'Please allow photo library access to upload a poster.');
+          Alert.alert(
+            'Permission required',
+            'Please allow photo library access to upload a poster.'
+          );
           return;
         }
       }
@@ -131,18 +148,23 @@ const CreateEvent: React.FC<CreateEventProps> = ({
         mediaTypes: ImagePicker.MediaTypeOptions.Images,
         allowsEditing: true,
         quality: 0.95,
-        base64: Platform.OS !== 'web', // base64 only needed on native
+        base64: Platform.OS !== 'web',
       });
       if (result.canceled) return;
 
       const asset = result.assets[0];
 
-      // Derive extension & content-type
       const extRaw = asset.fileName?.split('.').pop()?.toLowerCase();
-      const ext = extRaw && ['png', 'jpg', 'jpeg', 'webp'].includes(extRaw) ? extRaw : 'jpg';
-      let contentType = asset.mimeType || (ext === 'jpg' ? 'image/jpeg' : `image/${ext}`);
+      const ext =
+        extRaw && ['png', 'jpg', 'jpeg', 'webp'].includes(extRaw)
+          ? extRaw
+          : 'jpg';
+      let contentType =
+        asset.mimeType || (ext === 'jpg' ? 'image/jpeg' : `image/${ext}`);
 
-      const path = `events/${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`;
+      const path = `events/${Date.now()}_${Math.random()
+        .toString(36)
+        .slice(2)}.${ext}`;
 
       setPosterUploading(true);
 
@@ -155,7 +177,9 @@ const CreateEvent: React.FC<CreateEventProps> = ({
       } else {
         const b64 =
           asset.base64 ??
-          (await FileSystem.readAsStringAsync(asset.uri, { encoding: FileSystem.EncodingType.Base64 }));
+          (await FileSystem.readAsStringAsync(asset.uri, {
+            encoding: FileSystem.EncodingType.Base64,
+          }));
         bytes = decode(b64);
       }
 
@@ -169,7 +193,9 @@ const CreateEvent: React.FC<CreateEventProps> = ({
         return;
       }
 
-      const { data: pub } = supabase.storage.from(STORAGE_BUCKET).getPublicUrl(path);
+      const { data: pub } = supabase.storage
+        .from(STORAGE_BUCKET)
+        .getPublicUrl(path);
       setPosterUrl(pub.publicUrl);
       Alert.alert('Poster uploaded', 'Your poster is set.');
     } catch (e: any) {
@@ -192,7 +218,7 @@ const CreateEvent: React.FC<CreateEventProps> = ({
         return;
       }
 
-      const endISO = addHoursISO(startISO, 2); // default +2h
+      const endISO = addHoursISO(startISO, 2);
       const tags = category.trim() ? [category.trim()] : [];
 
       const payload = {
@@ -201,10 +227,10 @@ const CreateEvent: React.FC<CreateEventProps> = ({
         start_time: startISO,
         end_time: endISO,
         location: location.trim(),
-        tags,                        // text[]
-        status: 'pending' as const,  // review state
+        tags,
         raw_payload: { capacity: capacity || null },
-        poster_url: posterUrl,       // 👈 now saved with the submission
+        poster_url: posterUrl,
+        // 👈 no status
       };
 
       console.log('[CreateEvent] inserting payload =>', payload);
@@ -212,11 +238,16 @@ const CreateEvent: React.FC<CreateEventProps> = ({
       const { data, error, status } = await supabase
         .from('event_submissions')
         .insert([payload])
-        .select('id, title, status, created_at')
+        .select('id, title, created_at')
         .single();
 
       if (error) {
-        console.log('[event_submissions.insert] status:', status, 'error:', error);
+        console.log(
+          '[event_submissions.insert] status:',
+          status,
+          'error:',
+          error
+        );
         Alert.alert('Error', error.message);
         return;
       }
@@ -246,15 +277,26 @@ const CreateEvent: React.FC<CreateEventProps> = ({
     <SafeAreaView style={styles.container}>
       {/* Header */}
       <View style={styles.header}>
-        <TouchableOpacity onPress={onClose} style={styles.closeButton} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+        <TouchableOpacity
+          onPress={onClose}
+          style={styles.closeButton}
+          hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+        >
           <Text style={styles.closeIcon}>✕</Text>
         </TouchableOpacity>
         <Text style={styles.headerTitle}>Create Event</Text>
         <View style={styles.headerSpacer} />
       </View>
 
-      <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.select({ ios: 'padding', android: undefined })}>
-        <ScrollView style={styles.content} contentContainerStyle={{ paddingBottom: 24 + 72 }} showsVerticalScrollIndicator={false}>
+      <KeyboardAvoidingView
+        style={{ flex: 1 }}
+        behavior={Platform.select({ ios: 'padding', android: undefined })}
+      >
+        <ScrollView
+          style={styles.content}
+          contentContainerStyle={{ paddingBottom: 24 + 72 }}
+          showsVerticalScrollIndicator={false}
+        >
           <View style={styles.inputSection}>
             {/* Title */}
             <TextInput
@@ -303,7 +345,9 @@ const CreateEvent: React.FC<CreateEventProps> = ({
               }}
               style={styles.calendar}
             />
-            <Text style={styles.helperText}>Selected: {prettyDate(selectedDate)}</Text>
+            <Text style={styles.helperText}>
+              Selected: {prettyDate(selectedDate)}
+            </Text>
 
             {/* Time */}
             <Text style={styles.sectionLabel}>Start Time</Text>
@@ -311,11 +355,21 @@ const CreateEvent: React.FC<CreateEventProps> = ({
               {HOURS.map((h) => (
                 <TouchableOpacity
                   key={h}
-                  style={[styles.timeCell, selectedHour === h && styles.timeCellActive]}
+                  style={[
+                    styles.timeCell,
+                    selectedHour === h && styles.timeCellActive,
+                  ]}
                   onPress={() => setSelectedHour(h)}
                   activeOpacity={0.8}
                 >
-                  <Text style={[styles.timeText, selectedHour === h && styles.timeTextActive]}>{two(h)}:00</Text>
+                  <Text
+                    style={[
+                      styles.timeText,
+                      selectedHour === h && styles.timeTextActive,
+                    ]}
+                  >
+                    {two(h)}:00
+                  </Text>
                 </TouchableOpacity>
               ))}
             </View>
@@ -342,36 +396,57 @@ const CreateEvent: React.FC<CreateEventProps> = ({
             {/* Poster preview + uploader */}
             {posterUrl ? (
               <View style={{ alignItems: 'center', marginBottom: 12 }}>
-                <Image source={{ uri: posterUrl }} style={{ width: '100%', height: 160, borderRadius: 10 }} resizeMode="cover" />
-                <Text style={{ color: '#9ca3af', marginTop: 6 }}>Poster set ✓</Text>
+                <Image
+                  source={{ uri: posterUrl }}
+                  style={{ width: '100%', height: 160, borderRadius: 10 }}
+                  resizeMode="cover"
+                />
+                <Text style={{ color: '#9ca3af', marginTop: 6 }}>
+                  Poster set ✓
+                </Text>
               </View>
             ) : null}
 
             <TouchableOpacity
-              style={[styles.uploadButton, posterUploading && styles.disabledButton]}
+              style={[
+                styles.uploadButton,
+                posterUploading && styles.disabledButton,
+              ]}
               activeOpacity={0.85}
               onPress={pickAndUploadPoster}
               disabled={posterUploading}
             >
               <Text style={styles.uploadButtonText}>
-                {posterUploading ? 'Uploading…' : posterUrl ? 'Replace Poster' : 'Upload Poster'}
+                {posterUploading
+                  ? 'Uploading…'
+                  : posterUrl
+                  ? 'Replace Poster'
+                  : 'Upload Poster'}
               </Text>
             </TouchableOpacity>
 
             {/* Submit */}
             <TouchableOpacity
-              style={[styles.createButton, (!canCreateEvent || saving) && styles.disabledButton]}
+              style={[
+                styles.createButton,
+                (!canCreateEvent || saving) && styles.disabledButton,
+              ]}
               onPress={handleCreateEvent}
               disabled={!canCreateEvent || saving}
               activeOpacity={0.85}
             >
-              <Text style={styles.createButtonText}>{saving ? 'Saving…' : 'Create Event'}</Text>
+              <Text style={styles.createButtonText}>
+                {saving ? 'Saving…' : 'Create Event'}
+              </Text>
             </TouchableOpacity>
 
             {/* DEBUG: one-tap insert */}
             <TouchableOpacity
               onPress={testInsertNow}
-              style={[styles.createButton, { marginTop: 12, backgroundColor: '#e67e22' }]}
+              style={[
+                styles.createButton,
+                { marginTop: 12, backgroundColor: '#e67e22' },
+              ]}
               activeOpacity={0.85}
             >
               <Text style={styles.createButtonText}>TEST INSERT</Text>
@@ -386,27 +461,80 @@ const CreateEvent: React.FC<CreateEventProps> = ({
 // ---------- Styles ----------
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#1a2332' },
-  header: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingHorizontal: 20, paddingTop: 20, paddingBottom: 15 },
+  header: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingHorizontal: 20,
+    paddingTop: 20,
+    paddingBottom: 15,
+  },
   closeButton: { padding: 5 },
   closeIcon: { fontSize: 24, color: '#ffffff' },
-  headerTitle: { fontSize: 20, fontWeight: 'bold', color: '#ffffff', flex: 1, textAlign: 'center' },
+  headerTitle: {
+    fontSize: 20,
+    fontWeight: 'bold',
+    color: '#ffffff',
+    flex: 1,
+    textAlign: 'center',
+  },
   headerSpacer: { width: 34 },
   content: { flex: 1, paddingHorizontal: 20 },
-  inputSection: { backgroundColor: '#2c3e50', borderRadius: 12, padding: 16, marginBottom: 20, borderWidth: 1, borderColor: '#34495e' },
-  input: { backgroundColor: '#34495e', borderRadius: 10, paddingHorizontal: 15, paddingVertical: 12, marginBottom: 15, fontSize: 16, color: '#ffffff', borderWidth: 1, borderColor: '#4a5568' },
+  inputSection: {
+    backgroundColor: '#2c3e50',
+    borderRadius: 12,
+    padding: 16,
+    marginBottom: 20,
+    borderWidth: 1,
+    borderColor: '#34495e',
+  },
+  input: {
+    backgroundColor: '#34495e',
+    borderRadius: 10,
+    paddingHorizontal: 15,
+    paddingVertical: 12,
+    marginBottom: 15,
+    fontSize: 16,
+    color: '#ffffff',
+    borderWidth: 1,
+    borderColor: '#4a5568',
+  },
   multilineInput: { textAlignVertical: 'top' },
   sectionLabel: { color: '#bdc3c7', fontSize: 12, marginBottom: 8, marginTop: 6 },
   helperText: { color: '#9ca3af', fontSize: 12, marginBottom: 12 },
   calendar: { borderRadius: 12, overflow: 'hidden', marginBottom: 8 },
   timeGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 16 },
-  timeCell: { width: '19%', alignItems: 'center', paddingVertical: 10, backgroundColor: '#34495e', borderRadius: 8, borderWidth: 1, borderColor: '#4a5568', marginBottom: 8 },
+  timeCell: {
+    width: '19%',
+    alignItems: 'center',
+    paddingVertical: 10,
+    backgroundColor: '#34495e',
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#4a5568',
+    marginBottom: 8,
+  },
   timeCellActive: { backgroundColor: '#3498db', borderColor: '#3498db' },
   timeText: { color: '#ecf0f1', fontWeight: '600' },
   timeTextActive: { color: '#fff' },
   row: { flexDirection: 'row', alignItems: 'center', marginBottom: 15 },
-  uploadButton: { backgroundColor: '#34495e', borderRadius: 10, paddingVertical: 15, alignItems: 'center', marginBottom: 16, borderWidth: 1, borderColor: '#4a5568' },
+  uploadButton: {
+    backgroundColor: '#34495e',
+    borderRadius: 10,
+    paddingVertical: 15,
+    alignItems: 'center',
+    marginBottom: 16,
+    borderWidth: 1,
+    borderColor: '#4a5568',
+  },
   uploadButtonText: { color: '#ffffff', fontSize: 16, fontWeight: '500' },
-  createButton: { backgroundColor: '#3498db', borderRadius: 25, paddingVertical: 16, alignItems: 'center', marginBottom: 4 },
+  createButton: {
+    backgroundColor: '#3498db',
+    borderRadius: 25,
+    paddingVertical: 16,
+    alignItems: 'center',
+    marginBottom: 4,
+  },
   disabledButton: { opacity: 0.6 },
   createButtonText: { color: '#ffffff', fontSize: 18, fontWeight: 'bold' },
 });
