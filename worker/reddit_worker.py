@@ -1,203 +1,312 @@
-# worker/reddit_worker.py
+#!/usr/bin/env python3
+"""
+worker/reddit_worker.py (updated)
+
+Polls event_submissions for newly created events, searches reddit for posts/comments
+matching the event (by tags + title keywords + optional subreddits) and inserts into
+public.reddit_comments.
+
+Improvements in this version:
+ - strong env validation and helpful logs
+ - will skip processing an event if reddit_comments already exist for that event (avoids double-work)
+ - deduped subreddit list (explicit subreddits preferred, then mapped from tags)
+ - safer handling of PRAW exceptions and DB insert errors
+ - small jitter between polls to avoid thundering behavior
+ - configurable polling interval via REDDIT_POLL_SECONDS env var
+ - clear logging so you can see what is happening in Railway/Render logs
+
+Requirements (same as before):
+  - set env vars SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY
+  - set REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, REDDIT_USER_AGENT
+  - install deps: praw, supabase-py, vaderSentiment, psycopg2-binary (or use requirements.txt)
+"""
+
 import os
 import time
-import json
-from datetime import datetime, timezone
-import praw
-from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-from supabase import create_client, Client
-from postgrest.exceptions import APIError
+import logging
+import random
+from datetime import datetime, timezone, timedelta
+from typing import List, Dict, Any, Optional
 
-# --- Config / env checks ---
+import praw
+from supabase import create_client, Client
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+
+# Basic logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [reddit_worker] %(levelname)s: %(message)s"
+)
+logger = logging.getLogger("reddit_worker")
+
+# Environment config
 SB_URL = os.getenv("SUPABASE_URL")
 SB_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 RID = os.getenv("REDDIT_CLIENT_ID")
 RSEC = os.getenv("REDDIT_CLIENT_SECRET")
-UA = os.getenv("REDDIT_USER_AGENT", "campus-events-app/0.1")
-POLL = int(os.getenv("REDDIT_POLL_SECONDS", "60"))
+UA = os.getenv("REDDIT_USER_AGENT", "CampusEventsApp/0.1")
+POLL_SECONDS = int(os.getenv("REDDIT_POLL_SECONDS", "300"))  # default 5 minutes
+MAX_POSTS_PER_SUB = int(os.getenv("REDDIT_MAX_POSTS", "20"))
+MAX_COMMENTS_PER_POST = int(os.getenv("REDDIT_MAX_COMMENTS", "50"))
 
-missing = [k for k, v in {
-    "SUPABASE_URL": SB_URL,
-    "SUPABASE_SERVICE_ROLE_KEY": SB_KEY,
-    "REDDIT_CLIENT_ID": RID,
-    "REDDIT_CLIENT_SECRET": RSEC,
-}.items() if not v]
+if not SB_URL or not SB_KEY:
+    logger.error("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set in environment")
+    raise SystemExit(1)
+if not RID or not RSEC:
+    logger.error("REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET must be set in environment")
+    raise SystemExit(1)
 
-if missing:
-    raise SystemExit(f"[worker] Missing required env vars: {', '.join(missing)}")
-
-# --- Clients ---
+# create supabase client
 sb: Client = create_client(SB_URL, SB_KEY)
 
+# create reddit client
 reddit = praw.Reddit(client_id=RID, client_secret=RSEC, user_agent=UA)
+
+# sentiment analyzer
 analyzer = SentimentIntensityAnalyzer()
 
 
-def to_iso(ts):
-    try:
-        return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat()
-    except Exception:
-        return datetime.now(timezone.utc).isoformat()
+def senti(text: Optional[str]) -> float:
+    if not text:
+        return 0.0
+    return float(analyzer.polarity_scores(text).get("compound", 0.0))
 
 
-def senti(text: str) -> float:
-    return analyzer.polarity_scores(text or "").get("compound", 0.0)
+# Mapping from simple category tags to suggested subreddits
+CATEGORY_SUBREDDITS = {
+    "crypto": ["CryptoCurrency", "Bitcoin", "CryptoMarkets"],
+    "crypto_currency": ["CryptoCurrency", "Bitcoin", "CryptoMarkets"],
+    "blockchain": ["CryptoCurrency", "Bitcoin"],
+    "tech": ["technology", "programming"],
+    "technology": ["technology", "programming"],
+    "music": ["Music", "listentothis"],
+    "sports": ["sports", "soccer", "nba"],
+    "food": ["food", "cooking"],
+    "study": ["college", "AskAcademia"],
+    "futsal": ["soccer"],
+    "hackathon": ["programming", "technology"],
+    "workshop": ["learnprogramming", "programming"],
+    "cultural": ["culture", "AskReddit"],
+    # add more mappings as you like...
+}
 
 
-def extract_response(res):
-    """
-    Normalize different possible return shapes from supabase client execute().
-    Returns (data, error) where either may be None.
-    """
-    # common: object with .data and .error
-    data = getattr(res, "data", None)
-    err = getattr(res, "error", None)
-
-    # if not present, maybe it's a dict-like response
-    if data is None and isinstance(res, dict):
-        data = res.get("data")
-        err = res.get("error")
-
-    return data, err
-
-
-def fetch_events():
-    """
-    Fetch events that should be processed.
-    Uses `status = 'approved'` per your schema (not `published`).
-    Robust to different return shapes from supabase client.
-    """
-    try:
-        res = sb.table("event_submissions").select("*").eq("status", "approved").execute()
-        data, err = extract_response(res)
-        if err:
-            # Some clients embed error as {'message':...} or similar
-            print("[worker] Supabase returned error fetching events:", err)
-            return []
-        if data is None:
-            # unexpected shape: log repr for debugging
-            print("[worker] Unexpected supabase response shape in fetch_events:", repr(res))
-            return []
-        return data or []
-    except APIError as e:
-        print("[worker] APIError fetching events:", e)
-        return []
-    except Exception as e:
-        print("[worker] Unexpected error fetching events:", e)
-        return []
-
-
-def build_keywords(ev):
-    subs = []
-    if ev.get("subreddits"):
-        subs = [s for s in (ev.get("subreddits") or []) if s]
-    if not subs:
-        tags = ev.get("tags") or []
-        if isinstance(tags, str):
-            try:
-                tags = json.loads(tags)
-            except Exception:
-                tags = [tags]
-        title_words = (ev.get("title") or "").lower().split()
-        seen = set()
-        for t in [*tags, *title_words]:
-            if not t:
-                continue
-            tt = str(t).strip()
-            if tt and tt not in seen:
-                seen.add(tt)
-                subs.append(tt)
-            if len(subs) >= 8:
-                break
-    return subs[:8]
-
-
-def fetch_reddit_for_keyword(ev, kw):
-    posts = []
-    try:
-        sub = reddit.subreddit(kw)
-        for p in sub.hot(limit=5):
-            posts.append(p)
-        if posts:
-            return posts
-    except Exception as e:
-        print(f"[worker] subreddit fetch failed for '{kw}': {e} — trying search fallback")
-    try:
-        for p in reddit.subreddit("all").search(kw, sort="new", limit=8):
-            posts.append(p)
-    except Exception as e:
-        print(f"[worker] search failed for '{kw}': {e}")
-    return posts
-
-
-def transform_post(ev, p, kw):
-    created_iso = to_iso(getattr(p, "created_utc", time.time()))
-    body = getattr(p, "selftext", None)
-    title = getattr(p, "title", None)
-    payload = {
-        "permalink": getattr(p, "permalink", None),
-        "url": getattr(p, "url", None),
-        "id": getattr(p, "id", None),
-    }
+def normalize_event_row(ev: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a normalized event dict with safe keys."""
     return {
-        "event_id": ev["id"],
-        "reddit_id": f"t3_{getattr(p, 'id', '')}",
-        "subreddit": kw,
-        "type": "post",
-        "title": title,
-        "body": body or None,
-        "author": str(getattr(p, "author", None)) if getattr(p, "author", None) else None,
-        "sentiment": senti((title or "") + " " + (body or "")),
-        "created_utc": created_iso,
-        "payload": payload,
+        "id": ev.get("id"),
+        "title": ev.get("title") or "",
+        "description": ev.get("description") or "",
+        "tags": ev.get("tags") or [],
+        "subreddits": ev.get("subreddits") or [],
+        "created_at": ev.get("created_at"),
+        "start_time": ev.get("start_time"),
     }
 
 
-def store_reddit_data(rows):
-    if not rows:
-        return
+def build_subreddit_list(ev: Dict[str, Any]) -> List[str]:
+    """Build a deduped list of subreddits for an event.
+
+    Priority:
+      1) explicit ev.subreddits if provided
+      2) map tags/categories -> known subreddits
+      3) fallback to a small general list
+    """
+    # 1) explicit subreddits provided by the event
+    explicit = [s.strip() for s in (ev.get("subreddits") or []) if s and str(s).strip()]
+    if explicit:
+        # dedupe preserving order
+        return list(dict.fromkeys(explicit))
+
+    # 2) map tags -> subreddits
+    subs: List[str] = []
+    for tag in (ev.get("tags") or []):
+        key = str(tag).strip().lower().replace(" ", "_")
+        mapped = CATEGORY_SUBREDDITS.get(key)
+        if mapped:
+            subs.extend(mapped)
+
+    # 3) fallback general subreddits
+    if not subs:
+        subs = ["technology", "news"]
+
+    # dedupe and return
+    return list(dict.fromkeys([s for s in subs if s]))
+
+
+def event_already_processed(event_id: str) -> bool:
+    """Return True if reddit_comments already contain rows for this event_id."""
     try:
-        res = sb.table("reddit_comments").insert(rows).execute()
-        data, err = extract_response(res)
-        if err:
-            print("[worker] Supabase insert error:", err)
-        else:
-            print(f"[worker] Inserted {len(rows)} reddit rows")
+        res = sb.table("reddit_comments").select("id").eq("event_id", event_id).limit(1).execute()
+        if res.error:
+            logger.warning("check processed query error for event %s: %s", event_id, res.error)
+            return False
+        return bool(res.data)
     except Exception as e:
-        print("[worker] Exception inserting reddit rows:", e)
+        logger.exception("error checking if event already processed: %s", e)
+        return False
 
 
-def process_event(ev):
-    kws = build_keywords(ev)
-    if not kws:
-        print(f"[worker] No keywords/subreddits found for event {ev.get('id')}")
+def insert_comment_row(row: Dict[str, Any]) -> None:
+    """Insert a single reddit comment/post row into reddit_comments with duplicate handling."""
+    try:
+        res = sb.table("reddit_comments").insert(row).execute()
+        if res.error:
+            # common case: duplicate reddit_id -> skip
+            msg = getattr(res.error, "message", str(res.error)).lower()
+            if "unique" in msg or "duplicate" in msg or "already exists" in msg:
+                logger.debug("duplicate reddit_id %s -> skipping", row.get("reddit_id"))
+            else:
+                logger.warning("db insert error reddit_id=%s: %s", row.get("reddit_id"), res.error)
+        else:
+            logger.info("inserted reddit row reddit_id=%s type=%s", row.get("reddit_id"), row.get("type"))
+    except Exception as e:
+        logger.exception("unexpected insert error reddit_id=%s: %s", row.get("reddit_id"), e)
+
+
+def search_and_store_for_event(ev: Dict[str, Any]) -> None:
+    """Search reddit for posts/comments for the given normalized event and store results."""
+    event_id = ev["id"]
+    if not event_id:
+        logger.warning("empty event id, skipping")
         return
-    out = []
-    for kw in kws:
-        posts = fetch_reddit_for_keyword(ev, kw)
-        for p in posts:
-            try:
-                row = transform_post(ev, p, kw)
-                out.append(row)
-            except Exception as e:
-                print(f"[worker] transform error for post {getattr(p,'id',None)}: {e}")
-    store_reddit_data(out)
+
+    # If we already have reddit rows for this event, skip (prevents duplicate processing)
+    if event_already_processed(event_id):
+        logger.info("event %s already has reddit_comments -> skipping", event_id)
+        return
+
+    title_words = (ev.get("title") or "").lower().split()
+    # keywords prefer tags first then title words; cap to avoid huge queries
+    raw_keywords = [k for k in (ev.get("tags") or []) if k] + title_words
+    keywords = list(dict.fromkeys(raw_keywords))[:8] if raw_keywords else title_words[:5]
+
+    if not keywords:
+        logger.info("no keywords for event %s - skipping", event_id)
+        return
+
+    query = " OR ".join([str(k) for k in keywords if k])
+    subreddits = build_subreddit_list(ev)
+    logger.info("processing event=%s query=%r subs=%s", event_id, query, subreddits)
+
+    for sub_name in subreddits:
+        try:
+            subreddit = reddit.subreddit(sub_name)
+        except Exception as e:
+            logger.warning("cannot access subreddit %s: %s", sub_name, e)
+            continue
+
+        try:
+            # Search posts (newest first) matching the query
+            for post in subreddit.search(query, sort="new", limit=MAX_POSTS_PER_SUB):
+                try:
+                    post_id = getattr(post, "id", None)
+                    created_ts = getattr(post, "created_utc", None)
+                    created = datetime.fromtimestamp(created_ts, tz=timezone.utc) if created_ts else datetime.now(timezone.utc)
+                    post_row = {
+                        "event_id": event_id,
+                        "reddit_id": post_id,
+                        "subreddit": sub_name,
+                        "type": "post",
+                        "title": getattr(post, "title", None),
+                        "body": getattr(post, "selftext", None) or None,
+                        "author": str(getattr(post, "author", None)) if getattr(post, "author", None) else None,
+                        "sentiment": float(senti((getattr(post, "title", "") or "") + " " + (getattr(post, "selftext", "") or ""))),
+                        "created_utc": created.isoformat(),
+                        "payload": {
+                            "permalink": getattr(post, "permalink", None),
+                            "url": getattr(post, "url", None),
+                            "score": getattr(post, "score", None),
+                        },
+                    }
+                    insert_comment_row(post_row)
+                except Exception as e:
+                    logger.exception("error handling post in %s: %s", sub_name, e)
+
+                # Fetch top-level comments for the post (limited)
+                try:
+                    post.comments.replace_more(limit=0)
+                    comments = post.comments.list()[:MAX_COMMENTS_PER_POST]
+                    for c in comments:
+                        try:
+                            c_id = getattr(c, "id", None)
+                            c_ts = getattr(c, "created_utc", None) or created_ts
+                            crow = {
+                                "event_id": event_id,
+                                "reddit_id": c_id,
+                                "subreddit": sub_name,
+                                "type": "comment",
+                                "title": None,
+                                "body": getattr(c, "body", None) or None,
+                                "author": str(getattr(c, "author", None)) if getattr(c, "author", None) else None,
+                                "sentiment": float(senti(getattr(c, "body", "") or "")),
+                                "created_utc": datetime.fromtimestamp(c_ts, tz=timezone.utc).isoformat() if c_ts else datetime.now(timezone.utc).isoformat(),
+                                "payload": {"link_id": getattr(c, "link_id", None), "parent_id": getattr(c, "parent_id", None)},
+                            }
+                            insert_comment_row(crow)
+                        except Exception as e:
+                            logger.exception("error inserting comment for post %s: %s", getattr(post, "id", None), e)
+                except Exception as e:
+                    # Non-fatal if comments can't be fetched for a post
+                    logger.debug("could not fetch comments for post %s: %s", getattr(post, "id", None), e)
+
+        except Exception as e:
+            logger.exception("error searching subreddit %s for event %s: %s", sub_name, event_id, e)
+
+
+def fetch_new_events(since_iso: str) -> List[Dict[str, Any]]:
+    """Fetch event_submissions rows created since `since_iso` (inclusive).
+       We return raw rows as provided by Supabase client.
+    """
+    try:
+        q = sb.from_("event_submissions").select("*").gte("created_at", since_iso).order("created_at", {"ascending": True}).limit(200)
+        resp = q.execute()
+        if resp.error:
+            logger.error("fetch_new_events supabase error: %s", resp.error)
+            return []
+        return resp.data or []
+    except Exception as e:
+        logger.exception("fetch_new_events exception: %s", e)
+        return []
 
 
 def main_loop():
-    print("[worker] started, poll seconds:", POLL)
+    # Start a bit in the past so immediately picks recently created rows
+    last_check = datetime.now(timezone.utc) - timedelta(seconds=POLL_SECONDS + 5)
+    last_iso = last_check.isoformat()
+
+    logger.info("reddit worker started, poll interval=%s seconds", POLL_SECONDS)
+
     while True:
         try:
-            events = fetch_events()
-            if not events:
-                print("[worker] No approved events to process this cycle.")
+            now = datetime.now(timezone.utc)
+            logger.debug("checking for new events since %s", last_iso)
+            events = fetch_new_events(last_iso)
+            if events:
+                logger.info("found %d new event(s) since %s", len(events), last_iso)
+                for ev_raw in events:
+                    ev = normalize_event_row(ev_raw)
+                    if not ev.get("id"):
+                        logger.warning("skipping event without id: %s", ev_raw)
+                        continue
+                    try:
+                        search_and_store_for_event(ev)
+                    except Exception as e:
+                        logger.exception("error processing event %s: %s", ev.get("id"), e)
             else:
-                print(f"[worker] Processing {len(events)} approved event(s).")
-                for ev in events:
-                    process_event(ev)
+                logger.debug("no new events found since %s", last_iso)
+
+            # advance last_iso to now so we don't re-scan the same window
+            last_iso = now.isoformat()
+
         except Exception as e:
-            print("[worker] cycle error:", e)
-        time.sleep(POLL)
+            logger.exception("main loop error: %s", e)
+        finally:
+            # add small jitter to avoid hitting exact schedule repeatedly
+            jitter = random.uniform(0, min(5, POLL_SECONDS * 0.1))
+            sleep_for = max(1, POLL_SECONDS + jitter)
+            logger.debug("sleeping %s seconds (jitter=%s)", sleep_for, jitter)
+            time.sleep(sleep_for)
 
 
 if __name__ == "__main__":
