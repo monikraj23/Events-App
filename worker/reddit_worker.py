@@ -1,68 +1,60 @@
 #!/usr/bin/env python3
 """
-worker/reddit_worker.py (updated)
+worker/reddit_worker.py (job-queue version)
 
-Polls event_submissions for newly created events, searches reddit for posts/comments
-matching the event (by tags + title keywords + optional subreddits) and inserts into
-public.reddit_comments.
+This worker polls the reddit_jobs table for unprocessed jobs, claims them,
+fetches the associated event_submissions row, searches Reddit, inserts results
+into public.reddit_comments and then marks the job as processed (or logs the error
+and increments attempts).
 
-Improvements in this version:
- - strong env validation and helpful logs
- - will skip processing an event if reddit_comments already exist for that event (avoids double-work)
- - deduped subreddit list (explicit subreddits preferred, then mapped from tags)
- - safer handling of PRAW exceptions and DB insert errors
- - small jitter between polls to avoid thundering behavior
- - configurable polling interval via REDDIT_POLL_SECONDS env var
- - clear logging so you can see what is happening in Railway/Render logs
-
-Requirements (same as before):
-  - set env vars SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY
-  - set REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, REDDIT_USER_AGENT
-  - install deps: praw, supabase-py, vaderSentiment, psycopg2-binary (or use requirements.txt)
+Env variables required:
+  - SUPABASE_URL
+  - SUPABASE_SERVICE_ROLE_KEY  (service_role)
+  - REDDIT_CLIENT_ID
+  - REDDIT_CLIENT_SECRET
+  - REDDIT_USER_AGENT (optional)
+  - REDDIT_POLL_SECONDS (optional, default 300)
+  - REDDIT_MAX_POSTS (optional)
+  - REDDIT_MAX_COMMENTS (optional)
 """
 
 import os
 import time
 import logging
 import random
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 
 import praw
 from supabase import create_client, Client
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
-# Basic logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [reddit_worker] %(levelname)s: %(message)s"
-)
+# Logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [reddit_worker] %(levelname)s: %(message)s")
 logger = logging.getLogger("reddit_worker")
 
-# Environment config
+# --- Env ---
 SB_URL = os.getenv("SUPABASE_URL")
 SB_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 RID = os.getenv("REDDIT_CLIENT_ID")
 RSEC = os.getenv("REDDIT_CLIENT_SECRET")
 UA = os.getenv("REDDIT_USER_AGENT", "CampusEventsApp/0.1")
-POLL_SECONDS = int(os.getenv("REDDIT_POLL_SECONDS", "300"))  # default 5 minutes
+POLL_SECONDS = int(os.getenv("REDDIT_POLL_SECONDS", "300"))
 MAX_POSTS_PER_SUB = int(os.getenv("REDDIT_MAX_POSTS", "20"))
 MAX_COMMENTS_PER_POST = int(os.getenv("REDDIT_MAX_COMMENTS", "50"))
+JOB_BATCH_SIZE = int(os.getenv("REDDIT_JOB_BATCH_SIZE", "5"))  # how many jobs to claim at once
+MAX_ATTEMPTS = int(os.getenv("REDDIT_JOB_MAX_ATTEMPTS", "5"))
 
 if not SB_URL or not SB_KEY:
-    logger.error("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set in environment")
+    logger.error("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required")
     raise SystemExit(1)
 if not RID or not RSEC:
-    logger.error("REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET must be set in environment")
+    logger.error("REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET are required")
     raise SystemExit(1)
 
-# create supabase client
+# --- Clients ---
 sb: Client = create_client(SB_URL, SB_KEY)
-
-# create reddit client
 reddit = praw.Reddit(client_id=RID, client_secret=RSEC, user_agent=UA)
-
-# sentiment analyzer
 analyzer = SentimentIntensityAnalyzer()
 
 
@@ -72,7 +64,7 @@ def senti(text: Optional[str]) -> float:
     return float(analyzer.polarity_scores(text).get("compound", 0.0))
 
 
-# Mapping from simple category tags to suggested subreddits
+# Category -> subreddit mapping (expand as needed)
 CATEGORY_SUBREDDITS = {
     "crypto": ["CryptoCurrency", "Bitcoin", "CryptoMarkets"],
     "crypto_currency": ["CryptoCurrency", "Bitcoin", "CryptoMarkets"],
@@ -87,12 +79,10 @@ CATEGORY_SUBREDDITS = {
     "hackathon": ["programming", "technology"],
     "workshop": ["learnprogramming", "programming"],
     "cultural": ["culture", "AskReddit"],
-    # add more mappings as you like...
 }
 
 
 def normalize_event_row(ev: Dict[str, Any]) -> Dict[str, Any]:
-    """Return a normalized event dict with safe keys."""
     return {
         "id": ev.get("id"),
         "title": ev.get("title") or "",
@@ -105,99 +95,77 @@ def normalize_event_row(ev: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def build_subreddit_list(ev: Dict[str, Any]) -> List[str]:
-    """Build a deduped list of subreddits for an event.
-
-    Priority:
-      1) explicit ev.subreddits if provided
-      2) map tags/categories -> known subreddits
-      3) fallback to a small general list
-    """
-    # 1) explicit subreddits provided by the event
     explicit = [s.strip() for s in (ev.get("subreddits") or []) if s and str(s).strip()]
     if explicit:
-        # dedupe preserving order
         return list(dict.fromkeys(explicit))
-
-    # 2) map tags -> subreddits
     subs: List[str] = []
     for tag in (ev.get("tags") or []):
         key = str(tag).strip().lower().replace(" ", "_")
         mapped = CATEGORY_SUBREDDITS.get(key)
         if mapped:
             subs.extend(mapped)
-
-    # 3) fallback general subreddits
     if not subs:
         subs = ["technology", "news"]
-
-    # dedupe and return
     return list(dict.fromkeys([s for s in subs if s]))
 
 
 def event_already_processed(event_id: str) -> bool:
-    """Return True if reddit_comments already contain rows for this event_id."""
     try:
-        res = sb.table("reddit_comments").select("id").eq("event_id", event_id).limit(1).execute()
-        if res.error:
-            logger.warning("check processed query error for event %s: %s", event_id, res.error)
+        resp = sb.table("reddit_comments").select("id").eq("event_id", event_id).limit(1).execute()
+        if resp.error:
+            logger.warning("event_already_processed query error for %s: %s", event_id, resp.error)
             return False
-        return bool(res.data)
+        return bool(resp.data)
     except Exception as e:
-        logger.exception("error checking if event already processed: %s", e)
+        logger.exception("error checking processed status for event %s: %s", event_id, e)
         return False
 
 
 def insert_comment_row(row: Dict[str, Any]) -> None:
-    """Insert a single reddit comment/post row into reddit_comments with duplicate handling."""
     try:
-        res = sb.table("reddit_comments").insert(row).execute()
-        if res.error:
-            # common case: duplicate reddit_id -> skip
-            msg = getattr(res.error, "message", str(res.error)).lower()
+        resp = sb.table("reddit_comments").insert(row).execute()
+        if resp.error:
+            msg = getattr(resp.error, "message", str(resp.error)).lower()
             if "unique" in msg or "duplicate" in msg or "already exists" in msg:
-                logger.debug("duplicate reddit_id %s -> skipping", row.get("reddit_id"))
+                logger.debug("duplicate reddit_id %s: skipping", row.get("reddit_id"))
             else:
-                logger.warning("db insert error reddit_id=%s: %s", row.get("reddit_id"), res.error)
+                logger.warning("insert error reddit_id=%s: %s", row.get("reddit_id"), resp.error)
         else:
             logger.info("inserted reddit row reddit_id=%s type=%s", row.get("reddit_id"), row.get("type"))
     except Exception as e:
-        logger.exception("unexpected insert error reddit_id=%s: %s", row.get("reddit_id"), e)
+        logger.exception("unexpected insert exception for reddit_id=%s: %s", row.get("reddit_id"), e)
 
 
 def search_and_store_for_event(ev: Dict[str, Any]) -> None:
-    """Search reddit for posts/comments for the given normalized event and store results."""
-    event_id = ev["id"]
+    event_id = ev.get("id")
     if not event_id:
-        logger.warning("empty event id, skipping")
+        logger.warning("search_and_store_for_event: empty event id, skipping")
         return
 
-    # If we already have reddit rows for this event, skip (prevents duplicate processing)
+    # guard: if already have reddit rows, skip
     if event_already_processed(event_id):
-        logger.info("event %s already has reddit_comments -> skipping", event_id)
+        logger.info("event %s already processed (reddit_comments present) -> skipping", event_id)
         return
 
     title_words = (ev.get("title") or "").lower().split()
-    # keywords prefer tags first then title words; cap to avoid huge queries
     raw_keywords = [k for k in (ev.get("tags") or []) if k] + title_words
     keywords = list(dict.fromkeys(raw_keywords))[:8] if raw_keywords else title_words[:5]
-
     if not keywords:
         logger.info("no keywords for event %s - skipping", event_id)
         return
 
     query = " OR ".join([str(k) for k in keywords if k])
     subreddits = build_subreddit_list(ev)
-    logger.info("processing event=%s query=%r subs=%s", event_id, query, subreddits)
+    logger.info("event=%s searching query=%r subs=%s", event_id, query, subreddits)
 
-    for sub_name in subreddits:
+    for sub in subreddits:
         try:
-            subreddit = reddit.subreddit(sub_name)
+            subreddit = reddit.subreddit(sub)
         except Exception as e:
-            logger.warning("cannot access subreddit %s: %s", sub_name, e)
+            logger.warning("cannot access subreddit %s: %s", sub, e)
             continue
 
         try:
-            # Search posts (newest first) matching the query
             for post in subreddit.search(query, sort="new", limit=MAX_POSTS_PER_SUB):
                 try:
                     post_id = getattr(post, "id", None)
@@ -206,7 +174,7 @@ def search_and_store_for_event(ev: Dict[str, Any]) -> None:
                     post_row = {
                         "event_id": event_id,
                         "reddit_id": post_id,
-                        "subreddit": sub_name,
+                        "subreddit": sub,
                         "type": "post",
                         "title": getattr(post, "title", None),
                         "body": getattr(post, "selftext", None) or None,
@@ -221,20 +189,19 @@ def search_and_store_for_event(ev: Dict[str, Any]) -> None:
                     }
                     insert_comment_row(post_row)
                 except Exception as e:
-                    logger.exception("error handling post in %s: %s", sub_name, e)
+                    logger.exception("error handling post in %s: %s", sub, e)
 
-                # Fetch top-level comments for the post (limited)
+                # comments (best-effort)
                 try:
                     post.comments.replace_more(limit=0)
-                    comments = post.comments.list()[:MAX_COMMENTS_PER_POST]
-                    for c in comments:
+                    for c in post.comments.list()[:MAX_COMMENTS_PER_POST]:
                         try:
                             c_id = getattr(c, "id", None)
                             c_ts = getattr(c, "created_utc", None) or created_ts
                             crow = {
                                 "event_id": event_id,
                                 "reddit_id": c_id,
-                                "subreddit": sub_name,
+                                "subreddit": sub,
                                 "type": "comment",
                                 "title": None,
                                 "body": getattr(c, "body", None) or None,
@@ -247,66 +214,115 @@ def search_and_store_for_event(ev: Dict[str, Any]) -> None:
                         except Exception as e:
                             logger.exception("error inserting comment for post %s: %s", getattr(post, "id", None), e)
                 except Exception as e:
-                    # Non-fatal if comments can't be fetched for a post
-                    logger.debug("could not fetch comments for post %s: %s", getattr(post, "id", None), e)
+                    logger.debug("couldn't fetch comments for post %s: %s", getattr(post, "id", None), e)
 
         except Exception as e:
-            logger.exception("error searching subreddit %s for event %s: %s", sub_name, event_id, e)
+            logger.exception("search error for subreddit %s: %s", sub, e)
 
 
-def fetch_new_events(since_iso: str) -> List[Dict[str, Any]]:
-    """Fetch event_submissions rows created since `since_iso` (inclusive).
-       We return raw rows as provided by Supabase client.
+def claim_jobs(limit: int = JOB_BATCH_SIZE) -> List[Dict[str, Any]]:
+    """
+    Claim a small batch of unprocessed jobs. We use a simple
+    'select where processed=false order by created_at limit N' then update attempts.
+    For stronger guarantees you'd use SELECT ... FOR UPDATE SKIP LOCKED but Supabase/PostgREST
+    doesn't expose that directly; this approach is OK for small scale.
     """
     try:
-        q = sb.from_("event_submissions").select("*").gte("created_at", since_iso).order("created_at", {"ascending": True}).limit(200)
-        resp = q.execute()
-        if resp.error:
-            logger.error("fetch_new_events supabase error: %s", resp.error)
+        # get unprocessed jobs
+        res = sb.table("reddit_jobs").select("*").eq("processed", False).order("created_at", {"ascending": True}).limit(limit).execute()
+        if res.error:
+            logger.error("claim_jobs select error: %s", res.error)
             return []
-        return resp.data or []
+        rows = res.data or []
+        # increment attempts to indicate claim (best-effort)
+        for r in rows:
+            try:
+                sb.table("reddit_jobs").update({"attempts": (r.get("attempts") or 0) + 1}).eq("id", r["id"]).execute()
+            except Exception:
+                logger.debug("failed to bump attempts for job %s (ignore)", r.get("id"))
+        return rows
     except Exception as e:
-        logger.exception("fetch_new_events exception: %s", e)
+        logger.exception("claim_jobs exception: %s", e)
         return []
 
 
+def mark_job_processed(job_id: str) -> None:
+    try:
+        sb.table("reddit_jobs").update({"processed": True, "processed_at": datetime.now(timezone.utc).isoformat()}).eq("id", job_id).execute()
+    except Exception as e:
+        logger.exception("failed to mark job %s processed: %s", job_id, e)
+
+
+def mark_job_error(job_id: str, err: str) -> None:
+    try:
+        sb.table("reddit_jobs").update({"last_error": err, "processed": False}).eq("id", job_id).execute()
+    except Exception as e:
+        logger.exception("failed to update job error for %s: %s", job_id, e)
+
+
+def fetch_event_by_id(event_id: str) -> Optional[Dict[str, Any]]:
+    try:
+        resp = sb.table("event_submissions").select("*").eq("id", event_id).limit(1).execute()
+        if resp.error:
+            logger.error("fetch_event_by_id error: %s", resp.error)
+            return None
+        rows = resp.data or []
+        return rows[0] if rows else None
+    except Exception as e:
+        logger.exception("fetch_event_by_id exception: %s", e)
+        return None
+
+
 def main_loop():
-    # Start a bit in the past so immediately picks recently created rows
-    last_check = datetime.now(timezone.utc) - timedelta(seconds=POLL_SECONDS + 5)
-    last_iso = last_check.isoformat()
-
-    logger.info("reddit worker started, poll interval=%s seconds", POLL_SECONDS)
-
+    logger.info("reddit worker started (job queue mode), poll interval=%s secs", POLL_SECONDS)
     while True:
         try:
-            now = datetime.now(timezone.utc)
-            logger.debug("checking for new events since %s", last_iso)
-            events = fetch_new_events(last_iso)
-            if events:
-                logger.info("found %d new event(s) since %s", len(events), last_iso)
-                for ev_raw in events:
-                    ev = normalize_event_row(ev_raw)
-                    if not ev.get("id"):
-                        logger.warning("skipping event without id: %s", ev_raw)
+            jobs = claim_jobs(JOB_BATCH_SIZE)
+            if not jobs:
+                logger.debug("no jobs claimed - sleeping")
+            else:
+                logger.info("claimed %d job(s)", len(jobs))
+                for job in jobs:
+                    job_id = job.get("id")
+                    event_id = job.get("event_id")
+                    attempts = job.get("attempts", 0) or 0
+                    logger.info("processing job=%s event=%s attempts=%s", job_id, event_id, attempts)
+
+                    if attempts > MAX_ATTEMPTS:
+                        logger.warning("job %s exceeded max attempts (%s) - marking error and skipping", job_id, attempts)
+                        mark_job_error(job_id, f"exceeded max attempts {attempts}")
                         continue
+
+                    event_row = fetch_event_by_id(event_id)
+                    if not event_row:
+                        msg = f"event id {event_id} not found"
+                        logger.warning(msg)
+                        mark_job_error(job_id, msg)
+                        continue
+
+                    # normalize and process
+                    ev = normalize_event_row(event_row)
                     try:
                         search_and_store_for_event(ev)
+                        mark_job_processed(job_id)
+                        logger.info("job %s completed for event %s", job_id, event_id)
                     except Exception as e:
-                        logger.exception("error processing event %s: %s", ev.get("id"), e)
-            else:
-                logger.debug("no new events found since %s", last_iso)
+                        logger.exception("error processing job %s: %s", job_id, e)
+                        # record last_error and keep processed=false so it can be retried (or mark attempts > max to stop)
+                        mark_job_error(job_id, str(e))
 
-            # advance last_iso to now so we don't re-scan the same window
-            last_iso = now.isoformat()
-
-        except Exception as e:
-            logger.exception("main loop error: %s", e)
-        finally:
-            # add small jitter to avoid hitting exact schedule repeatedly
+            # small jitter before next poll
             jitter = random.uniform(0, min(5, POLL_SECONDS * 0.1))
-            sleep_for = max(1, POLL_SECONDS + jitter)
-            logger.debug("sleeping %s seconds (jitter=%s)", sleep_for, jitter)
-            time.sleep(sleep_for)
+            to_sleep = max(1, POLL_SECONDS + jitter)
+            logger.debug("sleeping %s seconds (jitter=%s)", to_sleep, jitter)
+            time.sleep(to_sleep)
+
+        except KeyboardInterrupt:
+            logger.info("received KeyboardInterrupt - exiting")
+            break
+        except Exception as e:
+            logger.exception("main loop unexpected error: %s", e)
+            time.sleep(max(5, POLL_SECONDS // 2))
 
 
 if __name__ == "__main__":
